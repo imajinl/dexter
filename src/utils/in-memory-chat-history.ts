@@ -1,6 +1,8 @@
-import { createHash } from 'crypto';
+import { HumanMessage, AIMessage, type BaseMessage } from '@langchain/core/messages';
 import { callLlm, DEFAULT_MODEL } from '../model/llm.js';
-import { z } from 'zod';
+
+const DEFAULT_HISTORY_LIMIT = 10;
+const FULL_ANSWER_TURNS = 3;
 
 /**
  * Represents a single conversation turn (query + answer + summary)
@@ -8,16 +10,9 @@ import { z } from 'zod';
 export interface Message {
   id: number;
   query: string;
-  answer: string;
-  summary: string; // LLM-generated summary of the answer
+  answer: string | null;   // null until answer completes
+  summary: string | null;  // LLM-generated summary, null until answer arrives
 }
-
-/**
- * Schema for LLM to select relevant messages
- */
-export const SelectedMessagesSchema = z.object({
-  message_ids: z.array(z.number()).describe('List of relevant message IDs (0-indexed)'),
-});
 
 /**
  * System prompt for generating message summaries
@@ -26,29 +21,17 @@ const MESSAGE_SUMMARY_SYSTEM_PROMPT = `You are a concise summarizer. Generate br
 Keep summaries to 1-2 sentences that capture the key information.`;
 
 /**
- * System prompt for selecting relevant messages
- */
-const MESSAGE_SELECTION_SYSTEM_PROMPT = `You are a relevance evaluator. Select which previous conversation messages are relevant to the current query.
-Return only message IDs that contain information directly useful for answering the current query.`;
-
-/**
  * Manages in-memory conversation history for multi-turn conversations.
  * Stores user queries, final answers, and LLM-generated summaries.
  */
 export class InMemoryChatHistory {
   private messages: Message[] = [];
   private model: string;
-  private relevantMessagesByQuery: Map<string, Message[]> = new Map();
+  private readonly maxTurns: number;
 
-  constructor(model: string = DEFAULT_MODEL) {
+  constructor(model: string = DEFAULT_MODEL, maxTurns: number = DEFAULT_HISTORY_LIMIT) {
     this.model = model;
-  }
-
-  /**
-   * Hashes a query string for cache key generation
-   */
-  private hashQuery(query: string): string {
-    return createHash('md5').update(query).digest('hex').slice(0, 12);
+    this.maxTurns = maxTurns;
   }
 
   /**
@@ -59,10 +42,10 @@ export class InMemoryChatHistory {
   }
 
   /**
-   * Generates a brief summary of an answer for later relevance matching
+   * Generates a brief summary of an answer for later context injection
    */
   private async generateSummary(query: string, answer: string): Promise<string> {
-    const answerPreview = answer.slice(0, 1500); // Limit for prompt size
+    const answerPreview = answer.slice(0, 1500);
 
     const prompt = `Query: "${query}"
 Answer: "${answerPreview}"
@@ -70,109 +53,39 @@ Answer: "${answerPreview}"
 Generate a brief 1-2 sentence summary of this answer.`;
 
     try {
-      const response = await callLlm(prompt, {
+      const { response } = await callLlm(prompt, {
         systemPrompt: MESSAGE_SUMMARY_SYSTEM_PROMPT,
         model: this.model,
       });
       return typeof response === 'string' ? response.trim() : String(response).trim();
     } catch {
-      // Fallback to a simple summary if LLM fails
       return `Answer to: ${query.slice(0, 100)}`;
     }
   }
 
   /**
-   * Adds a new conversation turn to history with an LLM-generated summary
+   * Saves a new user query to history immediately (before answer is available).
    */
-  async addMessage(query: string, answer: string): Promise<void> {
-    // Clear the relevance cache since message history has changed
-    this.relevantMessagesByQuery.clear();
-
-    const summary = await this.generateSummary(query, answer);
+  saveUserQuery(query: string): void {
     this.messages.push({
       id: this.messages.length,
       query,
-      answer,
-      summary,
+      answer: null,
+      summary: null,
     });
   }
 
   /**
-   * Uses LLM to select which messages are relevant to the current query.
-   * Results are cached by query hash to avoid redundant LLM calls within the same query.
+   * Saves the answer to the most recent message and generates a summary.
    */
-  async selectRelevantMessages(currentQuery: string): Promise<Message[]> {
-    if (this.messages.length === 0) {
-      return [];
+  async saveAnswer(answer: string): Promise<void> {
+    const lastMessage = this.messages[this.messages.length - 1];
+    if (!lastMessage || lastMessage.answer !== null) {
+      return;
     }
 
-    // Check cache first
-    const cacheKey = this.hashQuery(currentQuery);
-    const cached = this.relevantMessagesByQuery.get(cacheKey);
-    if (cached) {
-      return cached;
-    }
-
-    const messagesInfo = this.messages.map((message) => ({
-      id: message.id,
-      query: message.query,
-      summary: message.summary,
-    }));
-
-    const prompt = `Current user query: "${currentQuery}"
-
-Previous conversations:
-${JSON.stringify(messagesInfo, null, 2)}
-
-Select which previous messages are relevant to understanding or answering the current query.`;
-
-    try {
-      const response = await callLlm(prompt, {
-        systemPrompt: MESSAGE_SELECTION_SYSTEM_PROMPT,
-        model: this.model,
-        outputSchema: SelectedMessagesSchema,
-      });
-
-      const selectedIds = (response as { message_ids: number[] }).message_ids || [];
-
-      const selectedMessages = selectedIds
-        .filter((idx) => idx >= 0 && idx < this.messages.length)
-        .map((idx) => this.messages[idx]);
-
-      // Cache the result
-      this.relevantMessagesByQuery.set(cacheKey, selectedMessages);
-
-      return selectedMessages;
-    } catch {
-      // On failure, return empty (don't inject potentially irrelevant context)
-      return [];
-    }
-  }
-
-  /**
-   * Formats selected messages for task planning (queries + summaries only, lightweight)
-   */
-  formatForPlanning(messages: Message[]): string {
-    if (messages.length === 0) {
-      return '';
-    }
-
-    return messages
-      .map((message) => `User: ${message.query}\nAssistant: ${message.summary}`)
-      .join('\n\n');
-  }
-
-  /**
-   * Formats selected messages for answer generation (queries + full answers)
-   */
-  formatForAnswerGeneration(messages: Message[]): string {
-    if (messages.length === 0) {
-      return '';
-    }
-
-    return messages
-      .map((message) => `User: ${message.query}\nAssistant: ${message.answer}`)
-      .join('\n\n');
+    lastMessage.answer = answer;
+    lastMessage.summary = await this.generateSummary(lastMessage.query, answer);
   }
 
   /**
@@ -183,10 +96,29 @@ Select which previous messages are relevant to understanding or answering the cu
   }
 
   /**
-   * Returns user queries in chronological order (no LLM call)
+   * Returns recent completed turns as proper LangChain BaseMessage objects.
+   * Recent turns get full answers; older turns get summaries.
    */
-  getUserMessages(): string[] {
-    return this.messages.map((message) => message.query);
+  getRecentTurnsAsMessages(limit: number = this.maxTurns): BaseMessage[] {
+    const boundedLimit = Math.max(0, limit);
+    if (boundedLimit === 0) {
+      return [];
+    }
+
+    const completedMessages = this.messages.filter((message) => message.answer !== null);
+    const recentMessages = completedMessages.slice(-boundedLimit);
+
+    return recentMessages.flatMap((message, index) => {
+      const isRecentTurn = index >= recentMessages.length - FULL_ANSWER_TURNS;
+      const assistantContent = isRecentTurn
+        ? message.answer
+        : (message.summary ?? message.answer);
+
+      return [
+        new HumanMessage(message.query),
+        new AIMessage(assistantContent ?? ''),
+      ];
+    });
   }
 
   /**
@@ -197,10 +129,19 @@ Select which previous messages are relevant to understanding or answering the cu
   }
 
   /**
-   * Clears all messages and cache
+   * Removes the last message from history.
+   * Used to prune HEARTBEAT_OK turns that add no conversational value.
+   */
+  pruneLastTurn(): void {
+    if (this.messages.length > 0) {
+      this.messages.pop();
+    }
+  }
+
+  /**
+   * Clears all messages
    */
   clear(): void {
     this.messages = [];
-    this.relevantMessagesByQuery.clear();
   }
 }

@@ -1,3 +1,14 @@
+import { buildCompactToolDescriptions } from '../tools/registry.js';
+import { buildSkillMetadataSection, discoverSkills } from '../skills/index.js';
+import { readFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { getChannelProfile } from './channels.js';
+import { dexterPath } from '../utils/paths.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
 // ============================================================================
 // Helper Functions
 // ============================================================================
@@ -13,6 +24,98 @@ export function getCurrentDate(): string {
     day: 'numeric',
   };
   return new Date().toLocaleDateString('en-US', options);
+}
+
+/**
+ * Load SOUL.md content from user override or bundled file.
+ */
+export async function loadSoulDocument(): Promise<string | null> {
+  const userSoulPath = dexterPath('SOUL.md');
+  try {
+    return await readFile(userSoulPath, 'utf-8');
+  } catch {
+    // Continue to bundled fallback when user override is missing/unreadable.
+  }
+
+  const bundledSoulPath = join(__dirname, '../../SOUL.md');
+  try {
+    return await readFile(bundledSoulPath, 'utf-8');
+  } catch {
+    // SOUL.md is optional; keep prompt behavior unchanged when absent.
+  }
+
+  return null;
+}
+
+/**
+ * Load user-defined research rules from .dexter/RULES.md.
+ * Returns null if the file doesn't exist (rules are optional).
+ */
+export async function loadRulesDocument(): Promise<string | null> {
+  const rulesPath = dexterPath('RULES.md');
+  try {
+    return await readFile(rulesPath, 'utf-8');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build the skills section for the system prompt.
+ * Only includes skill metadata if skills are available.
+ */
+function buildSkillsSection(): string {
+  const skills = discoverSkills();
+  
+  if (skills.length === 0) {
+    return '';
+  }
+
+  const skillList = buildSkillMetadataSection();
+  
+  return `## Available Skills
+
+${skillList}
+
+## Skill Usage Policy
+
+- Check if available skills can help complete the task more effectively
+- When a skill is relevant, invoke it IMMEDIATELY as your first action
+- Skills provide specialized workflows for complex tasks (e.g., DCF valuation)
+- Do not invoke a skill that has already been invoked for the current query`;
+}
+
+function buildMemorySection(memoryFiles: string[], memoryContext?: string | null): string {
+  const fileListSection = memoryFiles.length > 0
+    ? `\nMemory files on disk: ${memoryFiles.join(', ')}`
+    : '';
+
+  const contextSection = memoryContext
+    ? `\n\n### What you know about the user\n\n${memoryContext}`
+    : '';
+
+  return `## Memory
+
+You have persistent memory stored as Markdown files in .dexter/memory/.${fileListSection}${contextSection}
+
+### Recalling memories
+Use memory_search to recall stored facts, preferences, or notes. The search covers all
+memory files (long-term and daily logs) AND past conversation transcripts.
+
+**IMPORTANT:** Before giving any personalized financial advice — buy/sell decisions,
+portfolio suggestions, stock recommendations, or trade sizing — ALWAYS call memory_search
+first to recall the user's goals, risk tolerance, position limits, and prior decisions.
+The user expects you to know them. Do not give generic advice when personalized context exists.
+
+Follow up with memory_get to read full sections when you need exact text.
+
+### Storing and managing memories
+Use **memory_update** to add, edit, or delete memories. Do NOT use write_file or
+edit_file for memory files.
+- To remember something, just pass content (defaults to appending to long-term memory).
+- For daily notes, pass file="daily".
+- For edits/deletes, pass action="edit" or action="delete" with old_text.
+Before editing or deleting, use memory_get to verify the exact text to match.`;
 }
 
 // ============================================================================
@@ -37,13 +140,67 @@ Your output is displayed on a command line interface. Keep responses short and c
 ## Response Format
 
 - Keep responses brief and direct
-- For comparative/tabular data, use Unicode box-drawing tables:
-  - Size columns appropriately: numeric data can be compact, text columns should be wider for readability
-  - Tables render in a terminal, so keep total width reasonable (~80-120 chars) and visually pleasing
-  - Use abbreviations for financial metrics: OCF, FCF, Op Inc, Net Inc, Rev, GM, OM
-  - Format numbers compactly: $102.5B not $102,466,000,000
 - For non-comparative information, prefer plain text or simple lists over tables
-- Do not use markdown text formatting (no **bold**, *italics*, headers) - use plain text, lists, and box-drawing tables`;
+- Do not use markdown headers or *italics* - use **bold** sparingly for emphasis
+
+## Tables (for comparative/tabular data)
+
+Use markdown tables. They will be rendered as formatted box tables.
+
+STRICT FORMAT - each row must:
+- Start with | and end with |
+- Have no trailing spaces after the final |
+- Use |---| separator (with optional : for alignment)
+
+| Ticker | Rev    | OM  |
+|--------|--------|-----|
+| AAPL   | 416.2B | 31% |
+
+Keep tables compact:
+- Max 2-3 columns; prefer multiple small tables over one wide table
+- Headers: 1-3 words max. "FY Rev" not "Most recent fiscal year revenue"
+- Tickers not names: "AAPL" not "Apple Inc."
+- Abbreviate: Rev, Op Inc, Net Inc, OCF, FCF, GM, OM, EPS
+- Numbers compact: 102.5B not $102,466,000,000
+- Omit units in cells if header has them`;
+
+// ============================================================================
+// Group Chat Context
+// ============================================================================
+
+export type GroupContext = {
+  groupName?: string;
+  membersList?: string;
+  activationMode: 'mention';
+};
+
+/**
+ * Build a system prompt section for group chat context.
+ */
+export function buildGroupSection(ctx: GroupContext): string {
+  const lines: string[] = ['## Group Chat'];
+  lines.push('');
+  if (ctx.groupName) {
+    lines.push(`You are participating in the WhatsApp group "${ctx.groupName}".`);
+  } else {
+    lines.push('You are participating in a WhatsApp group chat.');
+  }
+  lines.push('You were activated because someone @-mentioned you.');
+  lines.push('');
+  lines.push('### Group behavior');
+  lines.push('- Address the person who mentioned you by name');
+  lines.push('- Reference recent group context when relevant');
+  lines.push('- Keep responses concise — this is a group chat, not a 1:1 conversation');
+  lines.push('- Do not repeat information that was already shared in the group');
+
+  if (ctx.membersList) {
+    lines.push('');
+    lines.push('### Group members');
+    lines.push(ctx.membersList);
+  }
+
+  return lines.join('\n');
+}
 
 // ============================================================================
 // System Prompt
@@ -51,154 +208,77 @@ Your output is displayed on a command line interface. Keep responses short and c
 
 /**
  * Build the system prompt for the agent.
+ * @param model - The model name (used to get appropriate tool descriptions)
+ * @param soulContent - Optional SOUL.md identity content
+ * @param channel - Delivery channel (e.g., 'whatsapp', 'cli') — selects formatting profile
  */
-export function buildSystemPrompt(): string {
-  return `You are Dexter, a CLI assistant with access to financial research and web search tools.
+export function buildSystemPrompt(
+  model: string,
+  soulContent?: string | null,
+  channel?: string,
+  groupContext?: GroupContext,
+  memoryFiles?: string[],
+  memoryContext?: string | null,
+  rulesContent?: string | null,
+): string {
+  const toolDescriptions = buildCompactToolDescriptions(model);
+  const profile = getChannelProfile(channel);
+
+  const behaviorBullets = profile.behavior.map(b => `- ${b}`).join('\n');
+  const formatBullets = profile.responseFormat.map(b => `- ${b}`).join('\n');
+
+  const tablesSection = profile.tables
+    ? `\n## Tables (for comparative/tabular data)\n\n${profile.tables}`
+    : '';
+
+  return `You are Dexter, a ${profile.label} assistant with access to research tools.
 
 Current date: ${getCurrentDate()}
 
-Your output is displayed on a command line interface. Keep responses short and concise.
+${profile.preamble}
 
 ## Available Tools
 
-- financial_search: Intelligent meta-tool for financial data. Pass your complete query - it internally routes to multiple data sources (stock prices, financials, SEC filings, metrics, estimates, news, crypto). For comparisons or multi-company queries, pass the full query and let it handle the complexity.
-- web_search: Search the web for current information, news, and general knowledge
+${toolDescriptions}
+
+## Tool Usage Policy
+
+- Call get_financials or get_market_data ONCE with the full natural language query — they handle multi-company/multi-metric requests internally. Do NOT break up queries into multiple calls.
+- Only use web_fetch when headlines are insufficient (need quotes, deal specifics, earnings details).
+- Tool results are automatically capped. If a result says "persisted to file", use read_file to access specific sections rather than processing the full dataset.
+- Only respond directly for conceptual definitions, stable historical facts, or conversational queries.
+
+${buildSkillsSection()}
+
+${buildMemorySection(memoryFiles ?? [], memoryContext)}
 
 ## Behavior
 
-- Prioritize accuracy over validation - don't cheerfully agree with flawed assumptions
-- Use professional, objective tone without excessive praise or emotional validation
-- Only use tools when the query actually requires external data
-- For financial queries, call financial_search ONCE with the full query - it handles multi-company/multi-metric requests internally
-- For research tasks, be thorough but efficient
-- Avoid over-engineering responses - match the scope of your answer to the question
+${behaviorBullets}
+
+${rulesContent ? `## Research Rules
+
+The following rules were set by the user. Follow them on every query.
+
+${rulesContent}
+
+To manage these rules, the user can say "add a rule", "show my rules", "remove rule about X".
+Rules are stored in .dexter/RULES.md — use write_file or edit_file to modify them.
+` : ''}
+${soulContent ? `## Identity
+
+${soulContent}
+
+Embody the identity and investing philosophy described above. Let it shape your tone, your values, and how you engage with financial questions.
+` : ''}
 
 ## Response Format
 
-- Keep casual responses brief and direct
-- For research: lead with the key finding and include specific data points
-- For comparative/tabular data, use Unicode box-drawing tables:
-  - Tables render in a terminal, so ensure they are visually pleasing and readable
-  - Size columns appropriately: numeric data can be compact, text columns should be wider
-  - Keep total table width reasonable (~80-120 chars); prefer multiple small tables over one wide table
-  - Use abbreviations for financial metrics: OCF, FCF, Op Inc, Net Inc, Rev, GM, OM, EPS, Mkt Cap
-  - Dates as "Q4 FY25" not "2025-09-27" or "TTM @ 2025-09-27"
-  - Numbers compactly: $102.5B not $102,466,000,000
-- For non-comparative information, prefer plain text or simple lists over tables
-- Don't narrate your actions or ask leading questions about what the user wants
-- Do not use markdown text formatting (no **bold**, *italics*, headers) - use plain text, lists, and box-drawing tables`;
+${formatBullets}${tablesSection}${groupContext ? '\n\n' + buildGroupSection(groupContext) : ''}`;
 }
 
 // ============================================================================
 // User Prompts
 // ============================================================================
 
-/**
- * Build user prompt for agent iteration with tool summaries (context compaction).
- * Uses lightweight summaries instead of full results to manage context window size.
- */
-export function buildIterationPrompt(
-  originalQuery: string,
-  toolSummaries: string[]
-): string {
-  return `Original query: ${originalQuery}
 
-A summary of the tools you have called so far:
-${toolSummaries.join('\n')}
-
-Based on these summaries, either:
-1. Call additional tools if more data is needed (e.g., web_search for context not available via financial_search)
-2. Indicate you are ready to answer (respond without tool calls)`;
-}
-
-// ============================================================================
-// Final Answer Generation
-// ============================================================================
-
-const FINAL_ANSWER_SYSTEM_PROMPT_TEMPLATE = `You are Dexter, a helpful AI assistant.
-
-Current date: {current_date}
-
-Synthesize a clear answer to the user's query using the data provided.
-
-## Guidelines
-
-1. Use the relevant data from the provided tool results
-2. Include specific numbers, dates, and data points
-3. Lead with the key finding
-4. Be thorough but concise
-
-## Response Format
-
-- Lead with the direct answer
-- Support with specific data points
-- For comparative/tabular data, use Unicode box-drawing tables:
-  ┌────────────┬────────────┬────────────┐
-  │ Metric     │ Q4 FY25    │ Q3 FY25    │
-  ├────────────┼────────────┼────────────┤
-  │ Revenue    │ $102.5B    │ $94.0B     │
-  │ Net Inc    │ $27.5B     │ $23.4B     │
-  │ FCF        │ $25.1B     │ $24.0B     │
-  └────────────┴────────────┴────────────┘
-  Table rules:
-  - Tables render in a terminal, so ensure they are visually pleasing and readable
-  - Size columns appropriately: numeric data can be compact, text columns should be wider
-  - Keep total table width reasonable (~80-120 chars); prefer multiple small tables over one wide table
-  - Use abbreviations for financial metrics: OCF, FCF, Op Inc, Net Inc, Rev, GM, OM, EPS, P/E, Mkt Cap
-  - Dates as "Q4 FY25" not "TTM @ 2025-09-27"
-  - Numbers compactly: $102.5B not $102,466,000,000
-- For non-comparative information, prefer plain text or simple lists over tables
-- If data is incomplete or conflicting, acknowledge this
-- Do not use markdown text formatting (no **bold**, *italics*, headers) - use plain text, lists, and box-drawing tables`;
-
-/**
- * Get the system prompt for final answer generation.
- */
-export function getFinalAnswerSystemPrompt(): string {
-  return FINAL_ANSWER_SYSTEM_PROMPT_TEMPLATE.replace('{current_date}', getCurrentDate());
-}
-
-/**
- * Build the prompt for final answer generation with full context data.
- * This is used after context compaction - full data is loaded from disk for the final answer.
- */
-export function buildFinalAnswerPrompt(
-  originalQuery: string,
-  fullContextData: string
-): string {
-  return `Answer the following query using the data provided.
-
-## Query
-${originalQuery}
-
-## Available Data
-${fullContextData}
-
-Provide a comprehensive, well-structured answer based on this data.`;
-}
-
-// ============================================================================
-// Tool Summary Generation
-// ============================================================================
-
-/**
- * Build prompt for LLM-generated tool result summaries.
- * Used for context compaction - the LLM summarizes what it learned from each tool call.
- */
-export function buildToolSummaryPrompt(
-  originalQuery: string,
-  toolName: string,
-  toolArgs: Record<string, unknown>,
-  result: string
-): string {
-  const argsStr = Object.entries(toolArgs).map(([k, v]) => `${k}=${v}`).join(', ');
-  return `Summarize this tool result concisely.
-
-Query: ${originalQuery}
-Tool: ${toolName}(${argsStr})
-Result:
-${result}
-
-Write a 1 sentence summary of what was retrieved. Include specific values (numbers, dates) if relevant.
-Format: "[tool_call] -> [what was learned]"`;
-}

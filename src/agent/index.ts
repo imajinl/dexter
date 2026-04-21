@@ -1,19 +1,31 @@
 export { Agent } from './agent.js';
 
-export { ContextManager } from './context.js';
+export { Scratchpad } from './scratchpad.js';
 
-export { getCurrentDate, buildSystemPrompt, buildIterationPrompt, DEFAULT_SYSTEM_PROMPT } from './prompts.js';
+export { getCurrentDate, buildSystemPrompt, DEFAULT_SYSTEM_PROMPT } from './prompts.js';
 
 export type { 
-  ToolCallResult, 
+  ApprovalDecision,
   AgentConfig, 
   Message,
   AgentEvent,
   ThinkingEvent,
   ToolStartEvent,
+  ToolProgressEvent,
   ToolEndEvent,
   ToolErrorEvent,
-  AnswerStartEvent,
-  AnswerChunkEvent,
+  ToolApprovalEvent,
+  ToolDeniedEvent,
+  ToolLimitEvent,
+  ContextClearedEvent,
+  MemoryRecalledEvent,
+  MemoryFlushEvent,
   DoneEvent,
 } from './types.js';
+
+export type { 
+  ToolCallRecord, 
+  ScratchpadEntry,
+  ToolLimitConfig,
+  ToolUsageStatus,
+} from './scratchpad.js';

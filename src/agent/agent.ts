@@ -1,383 +1,621 @@
-import { AIMessage } from '@langchain/core/messages';
+import { AIMessage, AIMessageChunk, SystemMessage, HumanMessage, ToolMessage, type BaseMessage } from '@langchain/core/messages';
 import { StructuredToolInterface } from '@langchain/core/tools';
-import { callLlm, getFastModel } from '../model/llm.js';
-import { ContextManager } from './context.js';
-import { Scratchpad } from './scratchpad.js';
-import { createFinancialSearch, tavilySearch } from '../tools/index.js';
-import { buildSystemPrompt, buildIterationPrompt, getFinalAnswerSystemPrompt, buildFinalAnswerPrompt, buildToolSummaryPrompt } from '../agent/prompts.js';
+import { callLlmWithMessages, streamLlmWithMessages } from '../model/llm.js';
+import { getTools, getToolConcurrencyMap } from '../tools/registry.js';
+import { buildSystemPrompt, loadSoulDocument, loadRulesDocument } from './prompts.js';
 import { extractTextContent, hasToolCalls } from '../utils/ai-message.js';
-import { streamLlmResponse } from '../utils/llm-stream.js';
 import { InMemoryChatHistory } from '../utils/in-memory-chat-history.js';
-import type { AgentConfig, AgentEvent, ToolStartEvent, ToolEndEvent, ToolErrorEvent, ToolSummary, AnswerStartEvent, AnswerChunkEvent } from '../agent/types.js';
+import { estimateTokens, getAutoCompactThreshold, KEEP_TOOL_USES } from '../utils/tokens.js';
+import { exceedsSizeCap, persistLargeResult, buildPersistedContent } from '../utils/tool-result-storage.js';
+import { enforceResultBudget } from '../utils/tool-result-budget.js';
+import { formatUserFacingError, isContextOverflowError } from '../utils/errors.js';
+import type { AgentConfig, AgentEvent, CompactionEvent, ContextClearedEvent, MicrocompactEvent, QueueDrainEvent, TokenUsage } from '../agent/types.js';
+import type { MessageQueue } from '../utils/message-queue.js';
+import { compactContext, MAX_CONSECUTIVE_COMPACTION_FAILURES, MIN_TOOL_RESULTS_FOR_COMPACTION } from './compact.js';
+import { microcompactMessages } from './microcompact.js';
+import { createRunContext, type RunContext } from './run-context.js';
+import { AgentToolExecutor } from './tool-executor.js';
+import { MemoryManager } from '../memory/index.js';
+import { runMemoryFlush, shouldRunMemoryFlush } from '../memory/flush.js';
+import { resolveProvider } from '../providers.js';
 
 
+const DEFAULT_MODEL = 'gpt-5.4';
 const DEFAULT_MAX_ITERATIONS = 10;
-
-interface ToolCallRecord {
-  tool: string;
-  args: Record<string, unknown>;
-  result: string;
-}
-
-interface ToolExecutionResult {
-  record: ToolCallRecord;
-  summary: ToolSummary;
-  promptEntry: string;
-}
-
-interface ToolCallsExecutionResult {
-  records: ToolCallRecord[];
-  summaries: ToolSummary[];
-  promptEntries: string[];
-}
+const MAX_OVERFLOW_RETRIES = 2;
+const OVERFLOW_KEEP_ROUNDS = 3;
 
 /**
- * Agent - A simple ReAct-style agent that uses tools to answer queries.
+ * The core agent class that handles the agent loop and tool execution.
  *
  * Architecture:
- * 1. Initialize with financial_search and web_search tools
- * 2. Agent loop: Call LLM -> Execute tools -> Repeat until done
- * 3. Yield events for real-time UI updates
- *
- * Usage:
- *   const agent = Agent.create({ model: 'gpt-5.2' });
- *   for await (const event of agent.run(query)) { ... }
+ * - Growing message array with full reasoning continuity
+ * - Concurrent execution for read-only tools
+ * - Streaming LLM responses with fallback to blocking
+ * - Per-turn microcompact + threshold-based full compaction
  */
 export class Agent {
   private readonly model: string;
-  private readonly modelProvider: string;
   private readonly maxIterations: number;
-  private readonly contextManager: ContextManager;
   private readonly tools: StructuredToolInterface[];
   private readonly toolMap: Map<string, StructuredToolInterface>;
+  private readonly toolExecutor: AgentToolExecutor;
   private readonly systemPrompt: string;
   private readonly signal?: AbortSignal;
+  private readonly memoryEnabled: boolean;
+  private readonly messageQueue?: MessageQueue;
+  private compactionFailures: number = 0;
 
   private constructor(
     config: AgentConfig,
     tools: StructuredToolInterface[],
-    systemPrompt: string
+    systemPrompt: string,
+    concurrencyMap: Map<string, boolean>,
   ) {
-    this.model = config.model ?? 'gpt-5.2';
-    this.modelProvider = config.modelProvider ?? 'openai';
+    this.model = config.model ?? DEFAULT_MODEL;
     this.maxIterations = config.maxIterations ?? DEFAULT_MAX_ITERATIONS;
-    this.contextManager = new ContextManager();
     this.tools = tools;
     this.toolMap = new Map(tools.map(t => [t.name, t]));
+    this.toolExecutor = new AgentToolExecutor(
+      this.toolMap,
+      concurrencyMap,
+      config.signal,
+      config.requestToolApproval,
+      config.sessionApprovedTools,
+    );
     this.systemPrompt = systemPrompt;
     this.signal = config.signal;
+    this.memoryEnabled = config.memoryEnabled ?? true;
+    this.messageQueue = config.messageQueue;
+  }
+
+  static async create(config: AgentConfig = {}): Promise<Agent> {
+    const model = config.model ?? DEFAULT_MODEL;
+    const tools = getTools(model);
+    const concurrencyMap = getToolConcurrencyMap(model);
+    const soulContent = await loadSoulDocument();
+    const rulesContent = await loadRulesDocument();
+    let memoryFiles: string[] = [];
+    let memoryContext: string | null = null;
+
+    if (config.memoryEnabled !== false) {
+      const memoryManager = await MemoryManager.get();
+      memoryFiles = await memoryManager.listFiles();
+      const session = await memoryManager.loadSessionContext();
+      if (session.text.trim()) {
+        memoryContext = session.text;
+      }
+    }
+
+    const systemPrompt = buildSystemPrompt(
+      model,
+      soulContent,
+      config.channel,
+      config.groupContext,
+      memoryFiles,
+      memoryContext,
+      rulesContent,
+    );
+    return new Agent(config, tools, systemPrompt, concurrencyMap);
   }
 
   /**
-   * Create a new Agent instance with tools.
-   */
-  static create(config: AgentConfig = {}): Agent {
-    const model = config.model ?? 'gpt-5.2';
-    const tools: StructuredToolInterface[] = [
-      createFinancialSearch(model),
-      ...(process.env.TAVILY_API_KEY ? [tavilySearch] : []),
-    ];
-    const systemPrompt = buildSystemPrompt();
-    return new Agent(config, tools, systemPrompt);
-  }
-
-  /**
-   * Run the agent and yield events for real-time UI updates.
-   * Uses context compaction: summaries during loop, full data for final answer.
+   * Run the agent with streaming, concurrent tools, and microcompact.
    */
   async *run(query: string, inMemoryHistory?: InMemoryChatHistory): AsyncGenerator<AgentEvent> {
+    const startTime = Date.now();
+
     if (this.tools.length === 0) {
-      yield { type: 'done', answer: 'No tools available. Please check your API key configuration.', toolCalls: [], iterations: 0 };
+      yield { type: 'done', answer: 'No tools available. Please check your API key configuration.', toolCalls: [], iterations: 0, totalTime: Date.now() - startTime };
       return;
     }
 
-    const allToolCalls: ToolCallRecord[] = [];
-    const allSummaries: ToolSummary[] = [];
-    
-    // Create scratchpad for this query (append-only log of work done)
-    const scratchpad = new Scratchpad(query);
-    
-    // Build initial prompt with conversation history context
-    let currentPrompt = this.buildInitialPrompt(query, inMemoryHistory);
-    
-    let iteration = 0;
+    const ctx = createRunContext(query);
+    const memoryFlushState = { alreadyFlushed: false };
+
+    // Build initial message array
+    const historyMessages = inMemoryHistory?.getRecentTurnsAsMessages() ?? [];
+    let messages: BaseMessage[] = [
+      new SystemMessage(this.systemPrompt),
+      ...historyMessages,
+      new HumanMessage(query),
+    ];
 
     // Main agent loop
-    while (iteration < this.maxIterations) {
-      iteration++;
+    let overflowRetries = 0;
+    while (ctx.iteration < this.maxIterations) {
+      ctx.iteration++;
 
-      const response = await this.callModel(currentPrompt);
+      // Microcompact: per-turn lightweight trimming before LLM call
+      const mcResult = microcompactMessages(messages);
+      if (mcResult.trigger) {
+        messages = mcResult.messages;
+        yield { type: 'microcompact', cleared: mcResult.cleared, tokensSaved: mcResult.estimatedTokensSaved } as MicrocompactEvent;
+      }
+
+      // Strip old reasoning from AIMessages (keep last 2 for continuity)
+      this.stripOldThinking(messages, 2);
+
+      let response: AIMessage;
+      let usage: TokenUsage | undefined;
+
+      // Call LLM with streaming (falls back to blocking on error)
+      while (true) {
+        try {
+          const result = await this.callModelWithStreaming(messages);
+          response = result.response;
+          usage = result.usage;
+          overflowRetries = 0;
+          break;
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+
+          if (isContextOverflowError(errorMessage) && overflowRetries < MAX_OVERFLOW_RETRIES) {
+            overflowRetries++;
+            const removed = this.truncateMessages(messages, OVERFLOW_KEEP_ROUNDS);
+            if (removed > 0) {
+              yield { type: 'context_cleared', clearedCount: removed, keptCount: OVERFLOW_KEEP_ROUNDS };
+              continue;
+            }
+          }
+
+          const totalTime = Date.now() - ctx.startTime;
+          const provider = resolveProvider(this.model).displayName;
+          yield {
+            type: 'done',
+            answer: `Error: ${formatUserFacingError(errorMessage, provider)}`,
+            toolCalls: ctx.scratchpad.getToolCallRecords(),
+            iterations: ctx.iteration,
+            totalTime,
+            tokenUsage: ctx.tokenCounter.getUsage(),
+            tokensPerSecond: ctx.tokenCounter.getTokensPerSecond(totalTime),
+          };
+          return;
+        }
+      }
+
+      ctx.tokenCounter.add(usage);
+      if (usage?.inputTokens) {
+        ctx.lastApiInputTokens = usage.inputTokens;
+      }
+
       const responseText = extractTextContent(response);
 
       // Emit thinking if there are also tool calls
-      if (responseText && hasToolCalls(response)) {
-        scratchpad.addThinking(responseText);
-        yield { type: 'thinking', message: responseText };
+      if (responseText?.trim() && hasToolCalls(response)) {
+        const trimmedText = responseText.trim();
+        ctx.scratchpad.addThinking(trimmedText);
+        yield { type: 'thinking', message: trimmedText };
       }
 
-      // No tool calls = ready to generate final answer
+      // No tool calls = final answer
       if (!hasToolCalls(response)) {
-        // If no tools were called at all, just use the direct response
-        // This handles greetings, clarifying questions, etc.
-        if (allSummaries.length === 0 && responseText) {
-          yield { type: 'answer_start' };
-          yield { type: 'answer_chunk', text: responseText };
-          yield { type: 'done', answer: responseText, toolCalls: [], iterations: iteration };
-          return;
-        }
-
-        // Stream final answer with full context
-        const answerGenerator = this.generateFinalAnswer(query, allSummaries);
-        let fullAnswer = '';
-        
-        for await (const event of answerGenerator) {
-          yield event;
-          if (event.type === 'answer_chunk') {
-            fullAnswer += event.text;
-          }
-        }
-        
-        yield { type: 'done', answer: fullAnswer, toolCalls: allToolCalls, iterations: iteration };
+        yield* this.handleDirectResponse(responseText ?? '', ctx);
         return;
       }
 
-      // Execute tools and collect results
-      const generator = this.executeToolCalls(response, query);
-      let result = await generator.next();
+      // Push AIMessage to conversation history
+      messages.push(response);
 
-      // Execute tool calls and yield events
-      while (!result.done) {
-        yield result.value;
-        result = await generator.next();
+      // Execute tools concurrently where safe, collect ToolMessages by ID
+      let { toolMessages, denied } = yield* this.executeToolsAndCollectMessages(response, ctx);
+
+      // Cap large results (persist to disk, inject preview)
+      toolMessages = toolMessages.map(tm => {
+        const content = typeof tm.content === 'string' ? tm.content : JSON.stringify(tm.content);
+        if (exceedsSizeCap(content)) {
+          const { preview, filePath } = persistLargeResult(tm.name ?? 'unknown', tm.tool_call_id, content);
+          return new ToolMessage({
+            content: buildPersistedContent(filePath, preview, content.length),
+            tool_call_id: tm.tool_call_id,
+            name: tm.name,
+          });
+        }
+        return tm;
+      });
+
+      // Enforce per-turn total budget
+      toolMessages = enforceResultBudget(toolMessages);
+
+      messages.push(...toolMessages);
+
+      if (denied) {
+        const totalTime = Date.now() - ctx.startTime;
+        yield {
+          type: 'done',
+          answer: '',
+          toolCalls: ctx.scratchpad.getToolCallRecords(),
+          iterations: ctx.iteration,
+          totalTime,
+          tokenUsage: ctx.tokenCounter.getUsage(),
+          tokensPerSecond: ctx.tokenCounter.getTokensPerSecond(totalTime),
+        };
+        return;
       }
 
-      // Add tool entries to scratchpad and collect summaries
-      for (const entry of result.value.promptEntries) {
-        scratchpad.addToolEntry(entry);
+      // Context threshold management (may compact the message array)
+      const messageState = { messages };
+      yield* this.manageContextThreshold(ctx, query, memoryFlushState, messageState);
+      messages = messageState.messages;
+
+      // Inject tool usage warning if approaching limits
+      const toolUsageWarning = ctx.scratchpad.formatToolUsageForPrompt();
+      if (toolUsageWarning) {
+        messages.push(new HumanMessage(toolUsageWarning));
       }
-      allToolCalls.push(...result.value.records);
-      allSummaries.push(...result.value.summaries);
-      
-      // Build iteration prompt from scratchpad (always has full accumulated history)
-      currentPrompt = buildIterationPrompt(query, scratchpad.getToolSummaries());
+
+      // Drain queued messages: user may have sent follow-ups while agent was working
+      const drainResult = this.drainQueue();
+      if (drainResult) {
+        messages.push(new HumanMessage(drainResult.text));
+        yield { type: 'queue_drain', messageCount: drainResult.count, mergedText: drainResult.text } as QueueDrainEvent;
+      }
     }
 
-    // Max iterations reached - still generate proper final answer
-    const answerGenerator = this.generateFinalAnswer(query, allSummaries);
-    let fullAnswer = '';
-    
-    for await (const event of answerGenerator) {
-      yield event;
-      if (event.type === 'answer_chunk') {
-        fullAnswer += event.text;
-      }
-    }
-    
+    // Max iterations reached
+    const totalTime = Date.now() - ctx.startTime;
     yield {
       type: 'done',
-      answer: fullAnswer || `Reached maximum iterations (${this.maxIterations}). ${this.contextManager.getSummary()}`,
-      toolCalls: allToolCalls,
-      iterations: iteration
+      answer: `Reached maximum iterations (${this.maxIterations}). I was unable to complete the research in the allotted steps.`,
+      toolCalls: ctx.scratchpad.getToolCallRecords(),
+      iterations: ctx.iteration,
+      totalTime,
+      tokenUsage: ctx.tokenCounter.getUsage(),
+      tokensPerSecond: ctx.tokenCounter.getTokensPerSecond(totalTime),
     };
   }
 
+  // ---------------------------------------------------------------------------
+  // LLM call methods
+  // ---------------------------------------------------------------------------
+
   /**
-   * Call the LLM with the current prompt
+   * Call LLM with streaming, falling back to blocking invoke on error.
    */
-  private async callModel(prompt: string): Promise<AIMessage> {
-    return await callLlm(prompt, {
+  private async callModelWithStreaming(
+    messages: BaseMessage[],
+  ): Promise<{ response: AIMessage; usage?: TokenUsage }> {
+    try {
+      return await this.streamAndAccumulate(messages);
+    } catch {
+      // Fallback to blocking invoke (handles providers without streaming support)
+      return await this.callModelWithMessages(messages);
+    }
+  }
+
+  /**
+   * Stream the LLM response, accumulating chunks into a final AIMessage.
+   */
+  private async streamAndAccumulate(
+    messages: BaseMessage[],
+  ): Promise<{ response: AIMessage; usage?: TokenUsage }> {
+    let accumulated: AIMessageChunk | null = null;
+
+    for await (const chunk of streamLlmWithMessages(messages, {
       model: this.model,
-      systemPrompt: this.systemPrompt,
       tools: this.tools,
       signal: this.signal,
-    }) as AIMessage;
+    })) {
+      accumulated = accumulated ? accumulated.concat(chunk) : chunk;
+    }
+
+    if (!accumulated) {
+      throw new Error('Stream produced no chunks');
+    }
+
+    const response = new AIMessage({
+      content: accumulated.content,
+      tool_calls: accumulated.tool_calls,
+      invalid_tool_calls: accumulated.invalid_tool_calls,
+      usage_metadata: accumulated.usage_metadata,
+      response_metadata: accumulated.response_metadata,
+    });
+
+    const usage = accumulated.usage_metadata
+      ? {
+          inputTokens: accumulated.usage_metadata.input_tokens ?? 0,
+          outputTokens: accumulated.usage_metadata.output_tokens ?? 0,
+          totalTokens: accumulated.usage_metadata.total_tokens ?? 0,
+        }
+      : undefined;
+
+    return { response, usage };
   }
 
   /**
-   * Generate an LLM summary of a tool result for context compaction.
-   * The LLM summarizes what it learned, making the summary meaningful for subsequent iterations.
-   * Uses a fast model variant for the current provider to improve speed.
+   * Blocking LLM call (fallback when streaming fails).
    */
-  private async summarizeToolResult(
-    query: string,
-    toolName: string,
-    toolArgs: Record<string, unknown>,
-    result: string
-  ): Promise<string> {
-    // If toolName is empty, return an empty string
-    const prompt = buildToolSummaryPrompt(query, toolName, toolArgs, result);
-    const summary = await callLlm(prompt, {
-      model: getFastModel(this.modelProvider, this.model),
-      systemPrompt: 'You are a concise data summarizer.',
+  private async callModelWithMessages(
+    messages: BaseMessage[],
+  ): Promise<{ response: AIMessage; usage?: TokenUsage }> {
+    const result = await callLlmWithMessages(messages, {
+      model: this.model,
+      tools: this.tools,
       signal: this.signal,
     });
-    return String(summary);
+    return { response: result.response as AIMessage, usage: result.usage };
   }
 
+  // ---------------------------------------------------------------------------
+  // Tool execution
+  // ---------------------------------------------------------------------------
+
   /**
-   * Execute all tool calls from an LLM response
+   * Execute tools and collect ToolMessages mapped by tool_call_id.
+   * Supports concurrent execution — events may arrive out of order.
    */
-  private async *executeToolCalls(
+  private async *executeToolsAndCollectMessages(
     response: AIMessage,
-    query: string
-  ): AsyncGenerator<ToolStartEvent | ToolEndEvent | ToolErrorEvent, ToolCallsExecutionResult> {
-    const records: ToolCallRecord[] = [];
-    const summaries: ToolSummary[] = [];
-    const promptEntries: string[] = [];
+    ctx: RunContext,
+  ): AsyncGenerator<AgentEvent, { toolMessages: ToolMessage[]; denied: boolean }> {
+    const toolMessageMap = new Map<string, ToolMessage>();
+    let denied = false;
+    const toolCalls = response.tool_calls!;
 
-    for (const toolCall of response.tool_calls!) {
-      const toolName = toolCall.name;
-      const toolArgs = toolCall.args as Record<string, unknown>;
+    for await (const event of this.toolExecutor.executeAll(response, ctx)) {
+      yield event;
 
-      const generator = this.executeToolCall(toolName, toolArgs, query);
-      let result = await generator.next();
-
-      while (!result.done) {
-        yield result.value;
-        result = await generator.next();
+      if (event.type === 'tool_end' && event.toolCallId) {
+        toolMessageMap.set(event.toolCallId, new ToolMessage({
+          content: event.result,
+          tool_call_id: event.toolCallId,
+          name: event.tool,
+        }));
+      } else if (event.type === 'tool_error' && event.toolCallId) {
+        toolMessageMap.set(event.toolCallId, new ToolMessage({
+          content: `Error: ${event.error}`,
+          tool_call_id: event.toolCallId,
+          name: event.tool,
+        }));
+      } else if (event.type === 'tool_denied' && event.toolCallId) {
+        toolMessageMap.set(event.toolCallId, new ToolMessage({
+          content: 'Tool execution denied by user.',
+          tool_call_id: event.toolCallId,
+          name: event.tool,
+        }));
+        denied = true;
       }
-
-      records.push(result.value.record);
-      summaries.push(result.value.summary);
-      promptEntries.push(result.value.promptEntry);
     }
 
-    return { records, summaries, promptEntries };
+    // Produce ToolMessages in ORIGINAL tool_calls order
+    const toolMessages: ToolMessage[] = toolCalls.map(tc =>
+      toolMessageMap.get(tc.id!) ?? new ToolMessage({
+        content: 'Skipped (already executed).',
+        tool_call_id: tc.id!,
+        name: tc.name,
+      }),
+    );
+
+    return { toolMessages, denied };
   }
 
+  // ---------------------------------------------------------------------------
+  // Message queue
+  // ---------------------------------------------------------------------------
+
   /**
-   * Execute a single tool call and yield start/end/error events.
-   * Returns an LLM-generated summary for context compaction.
+   * Drain all queued messages, merge into a single text block.
+   * Returns null if the queue is empty or not configured.
    */
-  private async *executeToolCall(
-    toolName: string,
-    toolArgs: Record<string, unknown>,
-    query: string
-  ): AsyncGenerator<ToolStartEvent | ToolEndEvent | ToolErrorEvent, ToolExecutionResult> {
-    yield { type: 'tool_start', tool: toolName, args: toolArgs };
+  private drainQueue(): { text: string; count: number } | null {
+    if (!this.messageQueue || this.messageQueue.isEmpty()) {
+      return null;
+    }
+    const messages = this.messageQueue.dequeueAll();
+    if (messages.length === 0) return null;
+    return {
+      text: messages.map(m => m.text).join('\n\n'),
+      count: messages.length,
+    };
+  }
 
-    const startTime = Date.now();
+  // ---------------------------------------------------------------------------
+  // Response handling
+  // ---------------------------------------------------------------------------
 
-    try {
-      // Invoke tool directly from toolMap
-      const tool = this.toolMap.get(toolName);
-      if (!tool) {
-        throw new Error(`Tool '${toolName}' not found`);
+  private async *handleDirectResponse(
+    responseText: string,
+    ctx: RunContext,
+  ): AsyncGenerator<AgentEvent, void> {
+    const totalTime = Date.now() - ctx.startTime;
+    yield {
+      type: 'done',
+      answer: responseText,
+      toolCalls: ctx.scratchpad.getToolCallRecords(),
+      iterations: ctx.iteration,
+      totalTime,
+      tokenUsage: ctx.tokenCounter.getUsage(),
+      tokensPerSecond: ctx.tokenCounter.getTokensPerSecond(totalTime),
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Message array management
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Remove oldest AI+Tool message rounds, keeping SystemMessage, history,
+   * HumanMessage, and the most recent N rounds.
+   */
+  /**
+   * Strip text content from old AIMessages, keeping only the most recent N.
+   * Preserves tool_calls structure (required for ToolMessage pairing).
+   */
+  private stripOldThinking(messages: BaseMessage[], keepLast: number): void {
+    // Collect indices of AIMessages with text content
+    const aiIndices: number[] = [];
+    for (let i = 0; i < messages.length; i++) {
+      if (messages[i] instanceof AIMessage) {
+        aiIndices.push(i);
       }
-      const rawResult = await tool.invoke(toolArgs, this.signal ? { signal: this.signal } : undefined);
-      const result = typeof rawResult === 'string' ? rawResult : JSON.stringify(rawResult);
-      const duration = Date.now() - startTime;
+    }
 
-      // Save full result to disk and get lightweight summary
-      const summary = this.contextManager.saveAndGetSummary(toolName, toolArgs, result);
-
-      yield { type: 'tool_end', tool: toolName, args: toolArgs, result, duration };
-
-      // Generate LLM summary for context compaction
-      const llmSummary = await this.summarizeToolResult(query, toolName, toolArgs, result);
-
-      return {
-        record: { tool: toolName, args: toolArgs, result },
-        summary,
-        promptEntry: llmSummary,
-      };
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      yield { type: 'tool_error', tool: toolName, error: errorMessage };
-
-      // Create error summary
-      const errorSummary: ToolSummary = {
-        id: '',
-        toolName,
-        args: toolArgs,
-        summary: `${this.contextManager.getToolDescription(toolName, toolArgs)} [FAILED]`,
-      };
-
-      return {
-        record: { tool: toolName, args: toolArgs, result: `Error: ${errorMessage}` },
-        summary: errorSummary,
-        promptEntry: `- ${errorSummary.summary}: ${errorMessage}`,
-      };
+    // Only strip if we have more than keepLast AIMessages
+    const toStrip = aiIndices.slice(0, -keepLast);
+    for (const idx of toStrip) {
+      const msg = messages[idx] as AIMessage;
+      // Only strip if it has tool_calls (reasoning before tools — safe to clear)
+      if (msg.tool_calls && msg.tool_calls.length > 0 && msg.content) {
+        messages[idx] = new AIMessage({
+          content: '',
+          tool_calls: msg.tool_calls,
+          invalid_tool_calls: msg.invalid_tool_calls,
+          usage_metadata: msg.usage_metadata,
+          response_metadata: msg.response_metadata,
+        });
+      }
     }
   }
 
+  private truncateMessages(messages: BaseMessage[], keepRounds: number): number {
+    let roundStartIndex = 0;
+    for (let i = 0; i < messages.length; i++) {
+      if (messages[i] instanceof AIMessage) {
+        roundStartIndex = i;
+        break;
+      }
+    }
+    if (roundStartIndex === 0) return 0;
+
+    const rounds: { start: number; end: number }[] = [];
+    let i = roundStartIndex;
+    while (i < messages.length) {
+      if (messages[i] instanceof AIMessage) {
+        const start = i;
+        i++;
+        while (i < messages.length && (messages[i] instanceof ToolMessage || messages[i] instanceof HumanMessage)) {
+          i++;
+        }
+        rounds.push({ start, end: i });
+      } else {
+        i++;
+      }
+    }
+
+    const roundsToRemove = Math.max(0, rounds.length - keepRounds);
+    if (roundsToRemove === 0) return 0;
+
+    const removeEnd = rounds[roundsToRemove - 1].end;
+    const removed = removeEnd - roundStartIndex;
+    messages.splice(roundStartIndex, removed);
+    return removed;
+  }
+
   /**
-   * Build initial prompt with conversation history context if available
+   * Replace message array with compacted version after LLM summarization.
    */
-  private buildInitialPrompt(
+  private compactMessages(messages: BaseMessage[], summary: string, query: string): BaseMessage[] {
+    return [
+      messages[0], // SystemMessage
+      new HumanMessage(`${query}\n\n${summary}`),
+    ];
+  }
+
+  // ---------------------------------------------------------------------------
+  // Context threshold management
+  // ---------------------------------------------------------------------------
+
+  private async *manageContextThreshold(
+    ctx: RunContext,
     query: string,
-    inMemoryChatHistory?: InMemoryChatHistory
-  ): string {
-    if (!inMemoryChatHistory?.hasMessages()) {
-      return query;
+    memoryFlushState: { alreadyFlushed: boolean },
+    messageState: { messages: BaseMessage[] },
+  ): AsyncGenerator<ContextClearedEvent | CompactionEvent | AgentEvent, void> {
+    const estimatedContextTokens = ctx.lastApiInputTokens > 0
+      ? ctx.lastApiInputTokens
+      : estimateTokens(messageState.messages.map(m =>
+          typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+        ).join('\n'));
+    const threshold = getAutoCompactThreshold(this.model);
+
+    if (estimatedContextTokens <= threshold) {
+      return;
     }
 
-    const userMessages = inMemoryChatHistory.getUserMessages();
-    if (userMessages.length === 0) {
-      return query;
+    // Step 1: Memory flush
+    const fullToolResults = ctx.scratchpad.getToolResults();
+    if (
+      this.memoryEnabled &&
+      shouldRunMemoryFlush({
+        estimatedContextTokens,
+        threshold,
+        alreadyFlushed: memoryFlushState.alreadyFlushed,
+      })
+    ) {
+      yield { type: 'memory_flush', phase: 'start' };
+      const flushResult = await runMemoryFlush({
+        model: this.model,
+        systemPrompt: this.systemPrompt,
+        query,
+        toolResults: fullToolResults,
+        signal: this.signal,
+      }).catch(() => ({ flushed: false, written: false as const }));
+      memoryFlushState.alreadyFlushed = flushResult.flushed;
+      yield {
+        type: 'memory_flush',
+        phase: 'end',
+        filesWritten: flushResult.written ? [`${new Date().toISOString().slice(0, 10)}.md`] : [],
+      };
     }
 
-    const historyContext = userMessages.map((msg, i) => `${i + 1}. ${msg}`).join('\n');
-    return `Current query to answer: ${query}\n\nPrevious user queries for context:\n${historyContext}`;
-  }
+    // Step 2: Compaction
+    if (
+      this.compactionFailures < MAX_CONSECUTIVE_COMPACTION_FAILURES &&
+      ctx.scratchpad.getActiveToolResultCount() >= MIN_TOOL_RESULTS_FOR_COMPACTION
+    ) {
+      yield { type: 'compaction', phase: 'start', preCompactTokens: estimatedContextTokens };
 
-  /**
-   * Generate the final answer by loading full context data and streaming the response.
-   * This is the final step after context compaction - we load all data from disk.
-   */
-  private async *generateFinalAnswer(
-    query: string,
-    summaries: ToolSummary[]
-  ): AsyncGenerator<AnswerStartEvent | AnswerChunkEvent> {
-    yield { type: 'answer_start' };
+      try {
+        const result = await compactContext({
+          model: this.model,
+          systemPrompt: this.systemPrompt,
+          query,
+          toolResults: fullToolResults,
+          signal: this.signal,
+        });
 
-    // Load full context data from disk
-    const fullContext = this.buildFullContextForAnswer(summaries);
+        messageState.messages = this.compactMessages(messageState.messages, result.summary, query);
+        ctx.scratchpad.setCompactionSummary(result.summary);
 
-    // Build the final answer prompt
-    const prompt = buildFinalAnswerPrompt(query, fullContext);
-    const systemPrompt = getFinalAnswerSystemPrompt();
+        if (result.usage) {
+          ctx.tokenCounter.add(result.usage);
+        }
 
-    // Stream the final answer using provider-agnostic streaming
-    const stream = streamLlmResponse(prompt, {
-      model: this.model,
-      systemPrompt,
-    });
+        this.compactionFailures = 0;
+        memoryFlushState.alreadyFlushed = false;
 
-    for await (const chunk of stream) {
-      yield { type: 'answer_chunk', text: chunk };
-    }
-  }
+        const postCompactTokens = estimateTokens(
+          messageState.messages.map(m =>
+            typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+          ).join('\n'),
+        );
 
-  /**
-   * Build full context data for final answer generation.
-   * Loads full tool results from disk using the summaries' file pointers.
-   */
-  private buildFullContextForAnswer(summaries: ToolSummary[]): string {
-    if (summaries.length === 0) {
-      return 'No data was gathered.';
-    }
+        yield {
+          type: 'compaction',
+          phase: 'end',
+          success: true,
+          preCompactTokens: estimatedContextTokens,
+          postCompactTokens,
+          compactionModel: resolveProvider(this.model).fastModel ?? this.model,
+        };
 
-    // Get filepaths from summaries (filter out error summaries with empty ids)
-    const filepaths = summaries
-      .map(s => s.id)
-      .filter(id => id.length > 0);
-
-    if (filepaths.length === 0) {
-      return 'No data was successfully gathered.';
-    }
-
-    // Load full contexts from disk
-    const contexts = this.contextManager.loadFullContexts(filepaths);
-
-    if (contexts.length === 0) {
-      return 'Failed to load context data.';
+        return;
+      } catch {
+        this.compactionFailures++;
+        yield {
+          type: 'compaction',
+          phase: 'end',
+          success: false,
+          preCompactTokens: estimatedContextTokens,
+        };
+      }
     }
 
-    // Format contexts for the prompt
-    return contexts.map(ctx => {
-      const description = this.contextManager.getToolDescription(ctx.toolName, ctx.args);
-      return `### ${description}\n\`\`\`json\n${JSON.stringify(JSON.parse(ctx.result), null, 2)}\n\`\`\``;
-    }).join('\n\n');
+    // Step 3: Fallback — truncate oldest rounds
+    const removed = this.truncateMessages(messageState.messages, KEEP_TOOL_USES);
+    if (removed > 0) {
+      memoryFlushState.alreadyFlushed = false;
+      yield { type: 'context_cleared', clearedCount: removed, keptCount: KEEP_TOOL_USES };
+    }
   }
 }

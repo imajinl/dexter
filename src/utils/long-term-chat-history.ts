@@ -1,6 +1,7 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
+import { getDexterDir } from './paths.js';
 
 /**
  * Represents a conversation entry (user message + agent response pair)
@@ -17,7 +18,6 @@ interface MessagesFile {
   messages: ConversationEntry[];
 }
 
-const DEXTER_DIR = '.dexter';
 const MESSAGES_DIR = 'messages';
 const MESSAGES_FILE = 'chat_history.json';
 
@@ -32,7 +32,7 @@ export class LongTermChatHistory {
   private loaded = false;
 
   constructor(baseDir: string = process.cwd()) {
-    this.filePath = join(baseDir, DEXTER_DIR, MESSAGES_DIR, MESSAGES_FILE);
+    this.filePath = join(baseDir, getDexterDir(), MESSAGES_DIR, MESSAGES_FILE);
   }
 
   /**
@@ -119,10 +119,20 @@ export class LongTermChatHistory {
   }
 
   /**
-   * Returns just the user message strings in stack order (newest first).
+   * Returns user message strings in stack order (newest first).
+   * Deduplicates consecutive duplicates only (like shell HISTCONTROL=ignoredups).
    * Used for input history navigation.
    */
   getMessageStrings(): string[] {
-    return this.messages.map(m => m.userMessage);
+    const result: string[] = [];
+
+    for (const m of this.messages) {
+      const lastMessage = result[result.length - 1];
+      if (lastMessage !== m.userMessage) {
+        result.push(m.userMessage);
+      }
+    }
+
+    return result;
   }
 }
